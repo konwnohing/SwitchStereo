@@ -1,335 +1,176 @@
-# ESNet: A Resource-Aware Stereo Matching Network for Disparity Estimation on Edge Devices
+# SwitchStereo: Stereo Matching with Switchable Refinement for Low-Power Embedded GPUs
 
-This repository provides the official implementation of **ESNet**, a resource-aware stereo matching network designed for disparity estimation on resource-constrained edge devices.
+Official implementation of the paper
 
-ESNet adopts an efficient **2D/1D cascaded architecture**. It avoids explicit high-dimensional 3D cost-volume construction and 3D convolution-based cost aggregation. Instead, it combines recurrent correlation matching, progressive cascade refinement, and confidence-aware gated refinement to balance disparity quality, inference latency, and system-level memory usage.
+> **SwitchStereo: Stereo Matching with Switchable Refinement for Low-Power Embedded GPUs**
+> Lihong Lu, Song Wang, Keke Shang. Submitted to *The Visual Computer*.
+> (The network was called *ESNet* in earlier versions of this repository.)
 
-The method is designed for low-power edge visual perception and depth-perception display systems, where stable disparity prediction, boundary preservation, and deployment feasibility are important.
+SwitchStereo combines a RAFT-Stereo-style recurrent correlation matcher (RCM) at 1/8 resolution with a progressive refinement network (PRN) and a confidence-gated refinement module (Gate). It is deployed with TensorRT FP16 on a 4 GB NVIDIA Jetson Nano as two engines:
 
-## Highlights
+* **Fast**: feature extractor + RCM, bilinear up-sampling (separately trained model without PRN and Gate);
+* **Balanced**: feature extractor + RCM + PRN of the full model, with the branches that the trained network no longer uses removed from the exported graph.
 
-* A resource-aware stereo matching network for edge-device disparity estimation.
-* A compact 1D epipolar correlation representation without explicit 3D cost volumes.
-* Progressive cascade refinement and confidence-aware gated refinement for local detail recovery.
-* Multi-scale OHEM-L1 supervision with auxiliary physical regularization terms.
-* TensorRT FP16 deployment analysis on NVIDIA Jetson Nano 4GB.
+The repository contains the training code, the configurations of every model in the paper, the scripts that reproduce all tables, and the export, branch-removal and Jetson benchmarking scripts.
 
-## Repository Structure
+## Results
+
+KITTI 2015 benchmark (test set): **D1-all 3.38%** (D1-bg 2.93%, D1-fg 5.63%).
+
+Held-out KITTI 2015 pairs 000121–000199 (79 pairs) and Jetson Nano 4 GB (TensorRT 8.2.1, FP16, 320×640, MAXN):
+
+| Engine | Model | D1-all, crop (%) | D1-all, full (%) | Latency (ms) | FPS | Energy (J/frame) | TensorRT memory (MiB) |
+|---|---|---|---|---|---|---|---|
+| Fast | model A | 3.92 | 4.25 | 143.5 | 6.97 | 0.95 | 155 |
+| Balanced | final model, inactive branches removed | 2.88 | 3.69 | 410.8 | 2.43 | 2.64 | 203 |
+| Balanced (for comparison) | final model, inactive branches kept | 2.89 | 3.69 | 1621.2 | 0.62 | 9.43 | 506 |
+
+Crop: 384×1152 centre crop; full: whole image. See the paper for the ablations, boundary and depth analyses and the per-layer latency profile.
+
+## Repository structure
 
 ```text
-ESNet/
-├── configs/                 # YAML configuration files for training, evaluation, and ablation
-├── data/                    # Dataset loaders and data transforms
-├── engines/                 # Training and evaluation engines
-├── losses/                  # Multi-scale loss and physical constraint losses
-├── models/                  # ESNet model architecture
-├── scripts/                 # Training, evaluation, submission, and ONNX export scripts
-├── tests/                   # Analysis scripts for ablation, zero-shot, depth, and complexity
-├── utils/                   # Utility functions
-├── requirements.txt         # Python dependencies
+SwitchStereo/
+├── configs/
+│   ├── paper/              # exact configurations of all models in the paper (exported from the checkpoints)
+│   └── ...                 # original working configurations
+├── data/                   # dataset loaders and transforms
+├── engines/                # trainer and evaluator
+├── losses/                 # multi-scale OHEM-L1 loss and auxiliary terms
+├── models/                 # SwitchStereo architecture
+├── scripts/
+│   ├── train_main.py       # training entry (models A, B, C, OHEM, final, Scene Flow pre-training)
+│   ├── train_ohem_ratio.py # training entry of the OHEM-ratio experiment (Table 5)
+│   ├── eval_ohem.py        # evaluation of the OHEM-ratio models (Table 5)
+│   ├── merge_kitti.py      # merges KITTI 2012 and 2015 into one training folder
+│   └── submit_kitti.py     # KITTI benchmark submission
+├── analysis/               # scripts that reproduce the tables and figures of the paper
+├── deploy/                 # ONNX fixes, branch removal, consistency check and Jetson scripts
+├── requirements.txt
 └── README.md
 ```
 
 ## Installation
 
-Create a new Python environment and install the required dependencies:
+```bash
+conda create -n switchstereo python=3.10 -y
+conda activate switchstereo
+pip install -r requirements.txt
+pip install onnx onnxruntime        # only needed for the deployment scripts
+```
+
+Deployment on the Jetson Nano uses JetPack 4.6.1 (L4T R32.7.1, CUDA 10.2, TensorRT 8.2.1) and the MMDeploy TensorRT plugin library `libmmdeploy_tensorrt_ops.so` for grid sampling.
+
+## Data
+
+1. Download [KITTI 2015 and KITTI 2012 stereo](https://www.cvlibs.net/datasets/kitti/) (and the KITTI 2015 calibration files for the depth analysis), and [Scene Flow](https://lmb.informatik.uni-freiburg.de/resources/datasets/SceneFlowDatasets.en.html) for pre-training.
+2. Merge KITTI 2012 and 2015 into one folder (edit the paths at the top of the script):
+   ```bash
+   python scripts/merge_kitti.py      # -> datasets/kitti_mix/training/{image_2,image_3,disp_occ_0}
+   ```
+   Files are renamed `2012_*` and `2015_*`. After sorting, the first 80% (315 pairs: all KITTI 2012 pairs and KITTI 2015 000000–000120) are used for training and the last 20% (KITTI 2015 000121–000199, 79 pairs) are held out.
+3. Put the KITTI 2015 calibration files in `datasets/kitti2015/training/calib_cam_to_cam/` if you want to reproduce the depth table.
+
+## Pretrained weights
+
+Download the weights from the [Releases](../../releases) page and keep the folder names below, which the evaluation scripts expect:
+
+| Folder | Model in the paper |
+|---|---|
+| `checkpoints_sceneflow_pretrain_1/` | Scene Flow pre-training (zero-shot result, initialization of all KITTI models) |
+| `checkpoints_modelA/` | model A, no PRN and no Gate — **Fast engine** |
+| `checkpoints_modelrpn/` | model B, PRN |
+| `checkpoints_baseline/` | model C, PRN + Gate, L1 |
+| `checkpoints_ohem/` | PRN + Gate, OHEM-L1 |
+| `checkpoints_ohem+spatial/` | final model — **Balanced engine** |
+| `checkpoints_ohem_ablation/rho_0p2, rho_0p3, rho_0p4/` | OHEM-ratio experiment (Table 5) |
+
+Each folder contains `model_best.pth`.
+
+## Reproducing the tables
+
+All accuracy tables use the 79 held-out pairs.
 
 ```bash
-conda create -n esnet python=3.8 -y
-conda activate esnet
+# Tables 3, 4, 6, 7, 8 and 12 (crop, full image, boundary, inference-time variants, depth)
+python analysis/reproduce_tables.py --proj . --kitti_root datasets/kitti2015 \
+    --extra checkpoints_modelA/model_best.pth:raw_bilinear:ModelA
 
-pip install -r requirements.txt
+# Table 5 (OHEM ratio; 320×640 crop on KITTI 2015 000160–000199)
+python scripts/eval_ohem.py --config configs/ohem_ablation.yaml --resume checkpoints_ohem_ablation/rho_0p3/model_best.pth
+
+# Gate analysis (correction applied by the Gate at inference) and the training settings of each model
+python analysis/check_gate.py --proj . --kitti_root datasets/kitti2015
+
+# Inference-time variants and effective MACs of the final model
+python analysis/eval_variants.py --kitti_root datasets/kitti2015 --ckpts checkpoints_ohem+spatial/model_best.pth
+
+# Fig. 3
+python analysis/make_fig3.py --ckpt checkpoints_ohem+spatial/model_best.pth --kitti_root datasets/kitti2015
 ```
 
-The main dependencies include:
-
-```text
-torch
-torchvision
-numpy
-opencv-python
-Pillow
-PyYAML
-matplotlib
-tensorboard
-onnx
-thop
-tqdm
-```
-
-For TensorRT deployment, please install NVIDIA TensorRT separately according to your device and CUDA environment.
-
-## Datasets
-
-This project uses **Scene Flow** for pre-training and **KITTI 2015** for fine-tuning, evaluation, and submission.
-
-Please download the datasets from their official websites and arrange them as follows.
-
-### KITTI 2015
-
-```text
-KITTI2015/
-├── training/
-│   ├── image_2/
-│   ├── image_3/
-│   ├── disp_occ_0/
-│   └── disp_noc_0/
-└── testing/
-    ├── image_2/
-    └── image_3/
-```
-
-Then update the dataset path in the corresponding configuration files, for example:
-
-```yaml
-data:
-  root_dir: /path/to/KITTI2015
-```
-
-### Scene Flow
-
-Please prepare the Scene Flow dataset according to the dataloader settings in `data/` and update the path in:
-
-```text
-configs/train_sceneflow.yaml
-configs/sceneflow_config.yaml
-```
-
-## Pretrained Weights
-
-We provide the best-performing checkpoint of ESNet, corresponding to the **Accurate / Full ESNet** setting reported in the paper.
-
-The Fast, Balanced, and Accurate inference modes are derived from the same trained model by enabling or disabling the PRN and Gate modules during inference or ONNX export.
-
-The pretrained checkpoint can be downloaded from: sha256:68da797d9b6f814b7b134f42d0456d3f1469c5e26ef46bbe4ea20f38ada21b9f
-
-After downloading the checkpoint, place it under:
-
-```text
-pretrained/esnet_full_kitti2015_best.pth
-```
-
-Recommended checkpoint name:
-
-```text
-esnet_full_kitti2015_best.pth
-```
+Run the scripts from the repository root, because they import `models/` from the current directory.
 
 ## Training
 
-### Scene Flow Pre-training
+```bash
+# Scene Flow pre-training (ImageNet-initialized ResNet-18)
+python scripts/train_main.py --config configs/paper/sceneflow_pretrain.yaml
+
+# KITTI fine-tuning, e.g. the final model (use model_A.yaml, model_B.yaml, model_C.yaml or model_ohem.yaml for the ablations)
+python scripts/train_main.py --config configs/paper/final.yaml \
+    --resume checkpoints_sceneflow_pretrain_1/model_best.pth
+
+# continue an interrupted run
+python scripts/train_main.py --config configs/paper/final.yaml --continue_run
+```
+
+Fine-tuning runs for 300 epochs with batch size 4, 384×1152 crops and a cosine learning-rate schedule starting at 2×10⁻⁵; the checkpoint with the lowest held-out D1-all is kept. Edit `data.root_dir` in the configuration files to point to your data.
+
+## Deployment
+
+The ONNX graphs exported from the trained models are provided in the Releases. Starting from them:
 
 ```bash
-python scripts/train.py \
-  --config configs/train_sceneflow.yaml \
-  --ohem_ratio 0.3 \
-  --gpu 0
+# 1. set the grid-sampling plugin attributes to the training settings (align_corners = 1; zero padding in the RCM, border padding in the PRN)
+python deploy/fix_onnx_grid_attrs.py
+
+# 2. remove the inactive branches (Balanced engine) and build the shared-weight Fast variant
+python deploy/make_onnx_variants.py
+
+# 3. reference inputs and PyTorch outputs for the consistency check
+python deploy/make_consistency_inputs.py --ckpt checkpoints_ohem+spatial/model_best.pth --kitti_root datasets/kitti2015
+
+# 4. Fast engine with the weights of model A (graph surgery + weight swap, verified with ONNX Runtime)
+python deploy/make_fast_modelA.py --ref checkpoints_ohem+spatial/model_best.pth --new checkpoints_modelA/model_best.pth
 ```
 
-### KITTI 2015 Fine-tuning
+On the Jetson Nano, copy the resulting ONNX files, `consistency_inputs/`, the plugin library and the scripts in `deploy/` to one folder and run
 
 ```bash
-python scripts/train.py \
-  --config configs/kitti_finetune_final.yaml \
-  --resume pretrained/esnet_full_kitti2015_best.pth \
-  --ohem_ratio 0.3 \
-  --gpu 0
+bash jetson_final.sh          # builds the engines, measures latency, power and memory, runs the consistency check
+bash jetson_fastA.sh          # the same for the Fast engine of model A
+python3 compare_consistency.py
 ```
 
-If training from a Scene Flow pre-trained checkpoint, replace the `--resume` path with the corresponding pre-trained weight.
-
-## Evaluation
-
-### KITTI Validation Evaluation
-
-```bash
-python scripts/eval_ohem.py \
-  --config configs/kitti_finetune_final.yaml \
-  --resume pretrained/esnet_full_kitti2015_best.pth \
-  --gpu 0
-```
-
-### Official KITTI 2015 Submission
-
-To generate KITTI 2015 test-set disparity maps:
-
-```bash
-python scripts/submit_kitti.py
-```
-
-The generated disparity maps should be saved under:
-
-```text
-kitti_submission/disp_0/
-```
-
-Please make sure the dataset path and checkpoint path in `scripts/submit_kitti.py` or the corresponding config file are correctly set before running.
-
-## Ablation Experiments
-
-The following configuration files are provided for ablation studies:
-
-```text
-configs/ablation_1_baseline.yaml
-configs/ablation_2_edge.yaml
-configs/ablation_3_edge_ohem.yaml
-configs/ablation_4_full.yaml
-configs/ohem_ablation.yaml
-```
-
-Example command:
-
-```bash
-python scripts/train.py \
-  --config configs/ohem_ablation.yaml \
-  --resume pretrained/esnet_full_kitti2015_best.pth \
-  --ohem_ratio 0.3 \
-  --gpu 0
-```
-
-To evaluate an ablation checkpoint:
-
-```bash
-python scripts/eval_ohem.py \
-  --config configs/ohem_ablation.yaml \
-  --resume path/to/ablation_checkpoint.pth \
-  --gpu 0
-```
-
-## Zero-shot Evaluation
-
-Zero-shot evaluation is used to test the transfer ability from Scene Flow to KITTI 2015 without KITTI fine-tuning.
-
-```bash
-python tests/zero_shot.py
-```
-
-Before running, please check the dataset path and checkpoint path in the script or adapt them to your local environment.
-
-## Boundary-region Analysis
-
-Boundary-region analysis evaluates disparity quality around image-gradient-based object contours.
-
-```bash
-python tests/boundary_region_analysis_six.py \
-  --config configs/boundary_kitti.yaml
-```
-
-This analysis computes metrics such as Boundary D1 and Boundary EPE within boundary regions generated by Sobel gradients and dilation.
-
-## Depth Recovery Error Analysis
-
-Depth recovery analysis converts predicted disparity maps into depth values using KITTI stereo calibration parameters and reports errors across different distance ranges.
-
-```bash
-python tests/depth_ranging_analysis.py \
-  --config configs/depth_kitti.yaml
-```
-
-The reported metrics include:
-
-```text
-Depth MAE
-Depth RMSE
-AbsRel
-DispEPE
-```
-
-## Model Complexity and Inference Profiling
-
-To compute parameter count, MACs, and PyTorch CUDA inference latency for the three inference modes:
-
-```bash
-python tests/profile_complexity.py
-```
-
-The three inference modes are:
-
-```text
-Fast / Baseline:          use_prn=False, use_gate=False
-Balanced / PRN:           use_prn=True,  use_gate=False
-Accurate / Full ESNet:    use_prn=True,  use_gate=True
-```
-
-## ONNX Export and TensorRT Deployment
-
-To export the three deployment modes to ONNX:
-
-```bash
-python scripts/export_three_modes_onnx.py \
-  --mode all \
-  --weight pretrained/esnet_full_kitti2015_best.pth \
-  --output-dir onnx_three_modes
-```
-
-To export a single mode:
-
-```bash
-python scripts/export_three_modes_onnx.py \
-  --mode fast \
-  --weight pretrained/esnet_full_kitti2015_best.pth \
-  --output-dir onnx_three_modes
-```
-
-Supported modes:
-
-```text
-fast
-balanced
-accurate
-all
-```
-
-The exported ONNX files are intended for TensorRT FP16 deployment. For operators such as GridSample, TensorRT plugin support may be required.
-
-## Main Results
-
-### KITTI 2015 Official Test Set
-
-| Method | D1-bg (%) | D1-fg (%) | D1-all (%) |
-| ------ | --------: | --------: | ---------: |
-| ESNet  |      2.93 |      5.63 |       3.38 |
-
-### Jetson Nano Deployment
-
-Input resolution: `320 × 640`
-Precision: `TensorRT FP16`
-Batch size: `1`
-
-| Mode     | Architecture          |  Latency |  FPS | D1-all |
-| -------- | --------------------- | -------: | ---: | -----: |
-| Fast     | Baseline              | 150.6 ms | 6.64 |   3.94 |
-| Balanced | Baseline + PRN        |   885 ms | 1.13 |   2.99 |
-| Accurate | Baseline + PRN + Gate |  1063 ms | 0.94 |   2.88 |
-
-Note: The Jetson Nano D1-all values are used only for mode-level deployment comparison and should not be directly compared with the official KITTI 2015 test-set accuracy.
-
-## Notes
-
-* Dataset files and trained checkpoints are not included in the repository.
-* Please update dataset paths in the YAML configuration files before training or evaluation.
-* TensorRT deployment results may vary depending on CUDA, TensorRT version, plugins, and hardware configuration.
-* The provided scripts are intended for research reproduction and may need path adaptation for different environments.
+**Note.** Exporting grid sampling through the plugin with the default attributes (`align_corners = 0`, zero padding) silently changes the sampling positions; in our case it nearly doubled D1-all. Always compare the engine outputs with the PyTorch model before reporting deployment results.
 
 ## Citation
 
-If you find this repository useful, please cite our paper:
-
 ```bibtex
-@article{esnet2026,
-  title={ESNet: A Resource-Aware Stereo Matching Network for Disparity Estimation on Edge Devices},
-  author={Keke Shang and Song Wang },
-  journal={Displays},
-  year={2026}
+@article{switchstereo,
+  title   = {SwitchStereo: Stereo Matching with Switchable Refinement for Low-Power Embedded GPUs},
+  author  = {Lu, Lihong and Wang, Song and Shang, Keke},
+  journal = {The Visual Computer},
+  note    = {under review},
+  year    = {2026}
 }
 ```
 
-The citation information will be updated after publication.
+## Acknowledgements
+
+The matcher follows [RAFT-Stereo](https://github.com/princeton-vl/RAFT-Stereo); grid sampling on TensorRT uses the plugins of [MMDeploy](https://github.com/open-mmlab/mmdeploy).
 
 ## License
 
-This project is released for academic research purposes only. Please check the license file for detailed terms.
-
-## Acknowledgements
-
-This project uses public stereo matching datasets, including Scene Flow and KITTI 2015. We also thank the open-source PyTorch community and prior stereo matching works that inspired this research.
+To be added.
